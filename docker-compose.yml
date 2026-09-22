@@ -3,5 +3,6 @@ services:
     build: .
     image: podcast-chapter-studio
     ports:
-      - "8080:80"
+      # host port configurable via WEB_PORT (default 8080); container nginx stays on 80
+      - "${WEB_PORT:-8080}:80"
     restart: unless-stopped

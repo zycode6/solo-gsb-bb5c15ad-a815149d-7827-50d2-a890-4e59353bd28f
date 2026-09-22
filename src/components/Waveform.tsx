@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { LoudnessSegment } from '../audio/loudness';
 import type { Chapter, Peaks } from '../types';
+import type { ChainOutcome } from '../utils/chapterOps';
 import { clamp, formatTime } from '../utils/time';
 
 const RULER_H = 24;
@@ -27,21 +28,32 @@ interface WaveformProps {
   suggestions: number[];
   /** continuous 过轻/过响 ranges to color on the waveform */
   loudnessSegments: LoudnessSegment[];
+  /** chapter ids locked for this session (never overlap-propagated) */
+  lockedIds: ReadonlySet<string>;
+  /** chain-move mode on */
+  chainMode: boolean;
+  /** latest chain outcome of the ongoing gesture (live preview) */
+  liveChain: ChainOutcome | null;
   onZoom: (pxPerSec: number) => void;
   onSeek: (t: number) => void;
   /** click an abnormal band: start previewing from that time */
   onPreviewSegment: (t: number) => void;
   onSelect: (id: string | null) => void;
   onCreateFromDrag: (a: number, b: number, snap: number) => string | null;
-  onMove: (id: string, start: number, snap: number) => void;
-  onResize: (id: string, edge: 'start' | 'end', t: number, snap: number) => void;
+  onMove: (id: string, start: number, snap: number) => ChainOutcome | null;
+  onResize: (id: string, edge: 'start' | 'end', t: number, snap: number) => ChainOutcome | null;
+  /** chain summary updates while dragging (null = gesture ended) */
+  onChainLive: (o: ChainOutcome | null) => void;
+  /** persistent notice (locked press, feasibility restriction) */
+  onNotice: (msg: string) => void;
 }
 
 type DragState =
   | { mode: 'maybe-create'; startT: number }
   | { mode: 'create'; startT: number; curT: number }
   | { mode: 'move'; id: string; grabOffset: number }
-  | { mode: 'resize'; id: string; edge: 'start' | 'end' };
+  | { mode: 'resize'; id: string; edge: 'start' | 'end' }
+  | { mode: 'locked'; id: string };
 
 function niceStep(pxPerSec: number): number {
   const steps = [0.1, 0.25, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 1800, 3600];
@@ -51,9 +63,31 @@ function niceStep(pxPerSec: number): number {
   return 7200;
 }
 
+/**
+ * Time coordinate of the barrier that restricts an ongoing chain gesture:
+ * the facing edge of the blocking chapter, or the audio edge. null when the
+ * gesture is unconstrained. Chapters here are the PRE-gesture list; the live
+ * outcome moves the train toward (not into) the barrier.
+ */
+function barrierTime(o: ChainOutcome | null, chapters: Chapter[]): number | null {
+  if (!o?.allowed || !o.clamped) return null;
+  if (o.blockedBy === 'locked') {
+    // right-moving train stops at blocker.start; start-edge resize stops at
+    // blocker.end.
+    const b = chapters.find((c) => c.id === o.blockerId);
+    if (!b) return null;
+    if (o.kind === 'resize-start') return b.end;
+    return b.start;
+  }
+  return null; // audio edges sit outside the drawn region / have no marker
+}
+
 export function Waveform(props: WaveformProps) {
   const { peaks, chapters, selectedId, playhead, pxPerSec, follow, suggestions, loudnessSegments } =
     props;
+  const lockedIds = props.lockedIds;
+  const chainMode = props.chainMode;
+  const liveChain = props.liveChain;
   const scrollRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [viewportW, setViewportW] = useState(800);
@@ -63,6 +97,8 @@ export function Waveform(props: WaveformProps) {
   const pendingAnchor = useRef<{ t: number; x: number } | null>(null);
   const propsRef = useRef(props);
   propsRef.current = props;
+  const chainModeRef = useRef(chainMode);
+  chainModeRef.current = chainMode;
 
   const duration = peaks.duration;
   const totalWidth = Math.max(1, Math.ceil(duration * pxPerSec));
@@ -144,7 +180,11 @@ export function Waveform(props: WaveformProps) {
     let next: DragState;
     if (hit) {
       props.onSelect(hit.chapter.id);
-      if (hit.edge === 'body') {
+      if (lockedIds.has(hit.chapter.id)) {
+        // locked: selectable, never movable/resizable
+        next = { mode: 'locked', id: hit.chapter.id };
+        propsRef.current.onNotice('该章节已锁定，无法拖动 / 调整；取消锁定后即可编辑');
+      } else if (hit.edge === 'body') {
         next = { mode: 'move', id: hit.chapter.id, grabOffset: t - hit.chapter.start };
       } else {
         next = { mode: 'resize', id: hit.chapter.id, edge: hit.edge };
@@ -170,9 +210,11 @@ export function Waveform(props: WaveformProps) {
         dragRef.current = next2;
         setDrag(next2);
       } else if (cur.mode === 'move') {
-        propsRef.current.onMove(cur.id, ct - cur.grabOffset, SNAP_PX / pxPerSec);
+        const o = propsRef.current.onMove(cur.id, ct - cur.grabOffset, SNAP_PX / pxPerSec);
+        if (chainModeRef.current) propsRef.current.onChainLive(o);
       } else if (cur.mode === 'resize') {
-        propsRef.current.onResize(cur.id, cur.edge, ct, SNAP_PX / pxPerSec);
+        const o = propsRef.current.onResize(cur.id, cur.edge, ct, SNAP_PX / pxPerSec);
+        if (chainModeRef.current) propsRef.current.onChainLive(o);
       }
     };
     const onWinUp = (ev: MouseEvent) => {
@@ -181,6 +223,9 @@ export function Waveform(props: WaveformProps) {
       const cur = dragRef.current;
       dragRef.current = null;
       setDrag(null);
+      if (chainModeRef.current && (cur?.mode === 'move' || cur?.mode === 'resize')) {
+        propsRef.current.onChainLive(null);
+      }
       if (!cur) return;
       const { t: ct, x: cx } = timeAtClientX(ev.clientX);
       const isClick = Math.abs(cx - x) <= CLICK_PX;
@@ -210,7 +255,8 @@ export function Waveform(props: WaveformProps) {
     const { t, x } = timeAtClientX(e.clientX);
     const hit = hitTest(t, x);
     if (hit) {
-      canvas.style.cursor = hit.edge === 'body' ? 'grab' : 'ew-resize';
+      if (lockedIds.has(hit.chapter.id)) canvas.style.cursor = 'not-allowed';
+      else canvas.style.cursor = hit.edge === 'body' ? 'grab' : 'ew-resize';
     } else {
       canvas.style.cursor = hitBand(t) ? 'pointer' : 'crosshair';
     }
@@ -252,14 +298,33 @@ export function Waveform(props: WaveformProps) {
     const t0 = scrollLeft / pxPerSec;
     const t1 = (scrollLeft + w) / pxPerSec;
 
-    // chapter regions (under waveform tint)
+    // chapter regions (under waveform tint): locked chapters get an amber tint,
+    // chapters carried by an ongoing chain gesture get a cyan tint
+    const liveIds = new Set(liveChain?.allowed ? liveChain.affectedIds : []);
+    const barrierAt = barrierTime(liveChain, chapters);
     for (const c of chapters) {
       const x0 = c.start * pxPerSec - scrollLeft;
       const x1 = c.end * pxPerSec - scrollLeft;
       if (x1 < 0 || x0 > w) continue;
       const sel = c.id === selectedId;
-      ctx.fillStyle = sel ? 'rgba(64, 160, 255, 0.28)' : 'rgba(64, 160, 255, 0.13)';
+      const locked = lockedIds.has(c.id);
+      const inTrain = liveIds.has(c.id);
+      if (locked) {
+        ctx.fillStyle = sel ? 'rgba(255, 184, 77, 0.30)' : 'rgba(255, 184, 77, 0.15)';
+      } else if (inTrain) {
+        ctx.fillStyle = 'rgba(94, 234, 212, 0.26)';
+      } else {
+        ctx.fillStyle = sel ? 'rgba(64, 160, 255, 0.28)' : 'rgba(64, 160, 255, 0.13)';
+      }
       ctx.fillRect(x0, waveTop, x1 - x0, waveH);
+      if (locked) {
+        // hatched amber strip marks a locked chapter
+        ctx.fillStyle = 'rgba(255, 184, 77, 0.85)';
+        ctx.fillRect(x0, waveTop, x1 - x0, 3);
+      } else if (inTrain && !locked) {
+        ctx.fillStyle = 'rgba(94, 234, 212, 0.75)';
+        ctx.fillRect(x0, waveTop, x1 - x0, 3);
+      }
     }
 
     // loudness QC bands: continuous 过轻/过响 ranges, distinct colors
@@ -322,22 +387,70 @@ export function Waveform(props: WaveformProps) {
       const x1 = c.end * pxPerSec - scrollLeft;
       if (x1 < 0 || x0 > w) continue;
       const sel = c.id === selectedId;
-      ctx.strokeStyle = sel ? '#5eb1ff' : 'rgba(94, 177, 255, 0.55)';
-      ctx.lineWidth = sel ? 2 : 1;
+      const locked = lockedIds.has(c.id);
+      const inTrain = liveIds.has(c.id);
+      if (locked) {
+        ctx.strokeStyle = sel ? '#ffb84d' : 'rgba(255, 184, 77, 0.7)';
+      } else if (inTrain) {
+        ctx.strokeStyle = '#5eead4';
+      } else {
+        ctx.strokeStyle = sel ? '#5eb1ff' : 'rgba(94, 177, 255, 0.55)';
+      }
+      ctx.lineWidth = sel || inTrain ? 2 : 1;
       ctx.strokeRect(x0 + 0.5, waveTop + 0.5, x1 - x0 - 1, waveH - 1);
-      // handles
-      ctx.fillStyle = sel ? '#5eb1ff' : 'rgba(94, 177, 255, 0.8)';
-      ctx.fillRect(x0 - 2, waveTop, 4, 14);
-      ctx.fillRect(x1 - 2, waveTop, 4, 14);
-      ctx.fillRect(x0 - 2, waveTop + waveH - 14, 4, 14);
-      ctx.fillRect(x1 - 2, waveTop + waveH - 14, 4, 14);
+      // handles (hidden on locked chapters: no edge dragging)
+      if (!locked) {
+        ctx.fillStyle = sel ? '#5eb1ff' : 'rgba(94, 177, 255, 0.8)';
+        ctx.fillRect(x0 - 2, waveTop, 4, 14);
+        ctx.fillRect(x1 - 2, waveTop, 4, 14);
+        ctx.fillRect(x0 - 2, waveTop + waveH - 14, 4, 14);
+        ctx.fillRect(x1 - 2, waveTop + waveH - 14, 4, 14);
+      }
+      // lock badge / chain badge
+      ctx.font = '11px system-ui, sans-serif';
+      if (locked) {
+        ctx.fillStyle = 'rgba(255, 184, 77, 0.95)';
+        ctx.fillText('🔒 锁定', x0 + 6, waveTop + waveH - 7);
+      } else if (inTrain && liveChain && liveChain.clamped) {
+        ctx.fillStyle = 'rgba(94, 234, 212, 0.95)';
+        ctx.fillText('连锁·受限', x0 + 6, waveTop + waveH - 7);
+      }
       // label
       const label = c.title || '(未命名)';
       ctx.font = '12px system-ui, sans-serif';
       const tw = ctx.measureText(label).width;
       if (x1 - x0 > tw + 12) {
-        ctx.fillStyle = sel ? '#dceeff' : 'rgba(220, 238, 255, 0.75)';
+        ctx.fillStyle = locked
+          ? sel
+            ? '#ffe7c4'
+            : 'rgba(255, 231, 196, 0.8)'
+          : sel
+            ? '#dceeff'
+            : 'rgba(220, 238, 255, 0.75)';
         ctx.fillText(label, x0 + 6, waveTop + 16);
+      }
+    }
+
+    // feasibility barrier of an ongoing chain gesture: red dashed line at the
+    // locked chapter edge or audio boundary that stops the train
+    if (barrierAt !== null) {
+      const bx = barrierAt * pxPerSec - scrollLeft;
+      if (bx >= 0 && bx <= w) {
+        ctx.strokeStyle = 'rgba(255, 90, 90, 0.95)';
+        ctx.lineWidth = 1.5;
+        ctx.setLineDash([6, 4]);
+        ctx.beginPath();
+        ctx.moveTo(bx, waveTop);
+        ctx.lineTo(bx, waveTop + waveH);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = 'rgba(255, 90, 90, 0.95)';
+        ctx.beginPath();
+        ctx.moveTo(bx, waveTop);
+        ctx.lineTo(bx + 8, waveTop + 5);
+        ctx.lineTo(bx, waveTop + 10);
+        ctx.closePath();
+        ctx.fill();
       }
     }
 
@@ -419,6 +532,8 @@ export function Waveform(props: WaveformProps) {
     duration,
     suggestions,
     loudnessSegments,
+    lockedIds,
+    liveChain,
   ]);
 
   return (

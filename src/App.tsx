@@ -18,12 +18,14 @@ import {
 } from './audio/silence';
 import { Waveform } from './components/Waveform';
 import { ChapterList } from './components/ChapterList';
+import { ChainBar } from './components/ChainBar';
 import { FadePanel } from './components/FadePanel';
 import { LoudnessPanel } from './components/LoudnessPanel';
 import { SilencePanel } from './components/SilencePanel';
 import { TransportBar } from './components/TransportBar';
 import { useChapters } from './hooks/useChapters';
 import type { Chapter, Peaks } from './types';
+import { chainOutcomeText, type ChainOutcome } from './utils/chapterOps';
 import { downloadFile, toJSON, toWebVTT } from './utils/export';
 import { formatTime } from './utils/time';
 
@@ -67,6 +69,30 @@ export default function App() {
 
   const chaptersApi = useChapters(duration);
   const { chapters, selected, selectedId, reset: resetChapters } = chaptersApi;
+
+  // chain-move live preview + transient feasibility notice
+  const [liveChain, setLiveChain] = useState<ChainOutcome | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const noticeTimer = useRef<number | null>(null);
+  const showNotice = useCallback((msg: string) => {
+    setNotice(msg);
+    if (noticeTimer.current !== null) window.clearTimeout(noticeTimer.current);
+    noticeTimer.current = window.setTimeout(() => setNotice(null), 2600);
+  }, []);
+  useEffect(
+    () => () => {
+      if (noticeTimer.current !== null) window.clearTimeout(noticeTimer.current);
+    },
+    [],
+  );
+
+  /** consume a chain gesture outcome: clamped/rejected gestures are explained */
+  const handleChainOutcome = useCallback(
+    (o: ChainOutcome | null) => {
+      if (o && (!o.allowed || o.clamped)) showNotice(chainOutcomeText(o, chaptersApi.chapters));
+    },
+    [showNotice, chaptersApi],
+  );
 
   // drop fade settings of removed chapters (and of the previous file)
   useEffect(() => {
@@ -308,20 +334,28 @@ export default function App() {
         togglePlay();
       } else if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
         if (!sel) return;
-        const dir = e.key === 'ArrowLeft' ? -1 : 1;
-        if (e.altKey) {
-          chaptersApi.resize(sel.id, 'start', sel.start + dir * step, 0);
-        } else if (e.ctrlKey || e.metaKey) {
-          chaptersApi.resize(sel.id, 'end', sel.end + dir * step, 0);
-        } else {
-          chaptersApi.move(sel.id, sel.start + dir * step, 0);
+        if (chaptersApi.isLocked(sel.id)) {
+          showNotice('当前选中章节已锁定，无法移动 / 调整；先取消锁定再操作');
+          return;
         }
+        const dir = e.key === 'ArrowLeft' ? -1 : 1;
+        let o: ReturnType<typeof chaptersApi.move> = null;
+        if (e.altKey) {
+          o = chaptersApi.resize(sel.id, 'start', sel.start + dir * step, 0);
+        } else if (e.ctrlKey || e.metaKey) {
+          o = chaptersApi.resize(sel.id, 'end', sel.end + dir * step, 0);
+        } else {
+          o = chaptersApi.move(sel.id, sel.start + dir * step, 0);
+        }
+        if (o && o.clamped) showNotice(chainOutcomeText(o, chaptersApi.chapters));
       } else if (e.key === 'n' || e.key === 'N') {
         addAtPlayhead();
       } else if (e.key === 'p' || e.key === 'P') {
         previewSelection();
       } else if ((e.key === 'Delete' || e.key === 'Backspace') && sel) {
-        chaptersApi.remove(sel.id);
+        if (!chaptersApi.remove(sel.id)) {
+          showNotice('该章节已锁定，无法删除；先取消锁定再删除');
+        }
       } else if (e.key === 'Escape') {
         chaptersApi.select(null);
       } else {
@@ -331,7 +365,7 @@ export default function App() {
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [peaks, chaptersApi, togglePlay, previewSelection, addAtPlayhead]);
+  }, [peaks, chaptersApi, togglePlay, previewSelection, addAtPlayhead, showNotice]);
 
   const baseName = (fileName ?? 'podcast').replace(/\.[^.]+$/, '');
 
@@ -391,6 +425,15 @@ export default function App() {
             onZoom={setPxPerSec}
             onToggleFollow={() => setFollow((f) => !f)}
           />
+          <ChainBar
+            chainMode={chaptersApi.chainMode}
+            onToggleMode={chaptersApi.toggleChainMode}
+            lockedCount={chaptersApi.lockedIds.size}
+            totalCount={chapters.length}
+            live={liveChain}
+            chapters={chapters}
+            notice={notice}
+          />
           <Waveform
             peaks={peaks}
             chapters={chapters}
@@ -400,19 +443,33 @@ export default function App() {
             follow={follow && playing}
             suggestions={showSuggestions ? suggestions : []}
             loudnessSegments={loudnessSegments}
+            lockedIds={chaptersApi.lockedIds}
+            chainMode={chaptersApi.chainMode}
+            liveChain={liveChain}
             onZoom={setPxPerSec}
             onSeek={seek}
             onPreviewSegment={previewFrom}
             onSelect={chaptersApi.select}
             onCreateFromDrag={chaptersApi.createFromDrag}
-            onMove={chaptersApi.move}
-            onResize={chaptersApi.resize}
+            onMove={(id, start, snap) => {
+              const o = chaptersApi.move(id, start, snap);
+              handleChainOutcome(o);
+              return o;
+            }}
+            onResize={(id, edge, t, snap) => {
+              const o = chaptersApi.resize(id, edge, t, snap);
+              handleChainOutcome(o);
+              return o;
+            }}
+            onChainLive={setLiveChain}
+            onNotice={showNotice}
           />
           <div className="main-body">
             <ChapterList
               chapters={chapters}
               selectedId={selectedId}
               loudness={chapterLoudness}
+              lockedIds={chaptersApi.lockedIds}
               onSelect={(id) => {
                 chaptersApi.select(id);
                 const c = chapters.find((x) => x.id === id);
@@ -421,9 +478,12 @@ export default function App() {
               onPreview={previewChapter}
               onPreviewIssue={previewChapterIssue}
               onRename={chaptersApi.rename}
+              onToggleLock={chaptersApi.toggleLock}
               onRemove={(id) => {
                 if (previewRef.current?.chapterId === id) previewRef.current = null;
-                chaptersApi.remove(id);
+                if (!chaptersApi.remove(id)) {
+                  showNotice('该章节已锁定，无法删除；先在列表中解锁');
+                }
               }}
             />
             <aside className="detail-panel">
@@ -456,6 +516,15 @@ export default function App() {
                       onChange={(e) => chaptersApi.rename(selected.id, e.target.value)}
                     />
                   </label>
+                  <button
+                    className={chaptersApi.lockedIds.has(selected.id) ? 'lock-toggle is-locked' : 'lock-toggle'}
+                    onClick={() => chaptersApi.toggleLock(selected.id)}
+                    title="连锁移动时固定该章节；锁定状态仅保留在当前会话，不导出"
+                  >
+                    {chaptersApi.lockedIds.has(selected.id)
+                      ? '🔒 已锁定（点击解锁）'
+                      : '🔓 未锁定（连锁移动时可被带动）'}
+                  </button>
                   <div className="detail-times">
                     <span>开始 {formatTime(selected.start)}</span>
                     <span>结束 {formatTime(selected.end)}</span>
@@ -521,6 +590,10 @@ export default function App() {
                   <li><kbd>Alt</kbd>+<kbd>←</kbd><kbd>→</kbd> 调整起点</li>
                   <li><kbd>Ctrl</kbd>+<kbd>←</kbd><kbd>→</kbd> 调整终点</li>
                   <li><kbd>Delete</kbd> 删除选中章节</li>
+                  <li>
+                    波形上方勾选「连锁移动」后，拖动 / 缩放会带动后方未锁定章节；
+                    点击章节列表的 🔓 可锁定该章节（仅本会话有效，不导出）
+                  </li>
                   <li>滚轮：缩放波形；拖拽空白：创建章节</li>
                 </ul>
               </div>
