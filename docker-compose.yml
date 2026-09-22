@@ -1,0 +1,7 @@
+services:
+  podcast-chapter-studio:
+    build: .
+    image: podcast-chapter-studio
+    ports:
+      - "8080:80"
+    restart: unless-stopped
