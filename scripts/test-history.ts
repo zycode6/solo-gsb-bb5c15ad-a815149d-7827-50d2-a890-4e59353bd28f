@@ -137,5 +137,26 @@ function eq(actual: unknown, expected: unknown, msg: string) {
   check(h.undoStack.length === 2, 'custom window: 1ms gap merges');
 }
 
+// --- a chained drag (anchor + followers) is ONE undo step restoring every follower ---
+{
+  type Ch = { id: string; start: number; end: number };
+  const start: Ch[] = [
+    { id: 'a', start: 0, end: 10 },
+    { id: 'b', start: 20, end: 30 },
+    { id: 'c', start: 35, end: 40 },
+  ];
+  const shifted = (d: number): Ch[] => start.map((c) => ({ ...c, start: c.start + d, end: c.end + d }));
+  let h = emptyHistory<Ch[]>();
+  // mousemove frames during one drag all carry mergeKey `move:a`
+  h = record(h, { before: start, after: shifted(1), mergeKey: 'move:a', time: 10 });
+  h = record(h, { before: shifted(1), after: shifted(3), mergeKey: 'move:a', time: 20 });
+  h = record(h, { before: shifted(3), after: shifted(5), mergeKey: 'move:a', time: 30 });
+  check(h.undoStack.length === 1, 'chained drag coalesces into one history entry');
+  const undone = undo(h)!;
+  eq(undone.state, start, 'undo restores anchor AND every follower to the pre-drag layout');
+  const redone = redo(undone.history)!;
+  eq(redone.state, shifted(5), 'redo replays the whole chained ripple');
+}
+
 console.log(failures === 0 ? 'ALL PASS' : `${failures} FAILURES`);
 process.exit(failures === 0 ? 0 : 1);

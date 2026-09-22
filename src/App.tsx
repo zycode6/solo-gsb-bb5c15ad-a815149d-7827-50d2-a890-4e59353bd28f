@@ -18,12 +18,18 @@ import {
 } from './audio/silence';
 import { Waveform } from './components/Waveform';
 import { ChapterList } from './components/ChapterList';
+import { ChainBar } from './components/ChainBar';
 import { FadePanel } from './components/FadePanel';
 import { LoudnessPanel } from './components/LoudnessPanel';
 import { SilencePanel } from './components/SilencePanel';
 import { TransportBar } from './components/TransportBar';
 import { useChapters } from './hooks/useChapters';
 import type { Chapter, Peaks } from './types';
+import {
+  describeLimit,
+  describeLockedAnchor,
+  type ChainEditResult,
+} from './utils/chainOps';
 import { downloadFile, toJSON, toWebVTT } from './utils/export';
 import { formatTime } from './utils/time';
 
@@ -67,6 +73,62 @@ export default function App() {
 
   const chaptersApi = useChapters(duration);
   const { chapters, selected, selectedId, reset: resetChapters } = chaptersApi;
+
+  // 连锁移动：拖拽/缩放中的实时摘要 + 钳制原因提示（toast 按原因去重，避免每帧刷屏）
+  const [liveEdit, setLiveEdit] = useState<ChainEditResult | null>(null);
+  const liveAnchorIdRef = useRef<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const noticeKeyRef = useRef<string | null>(null);
+  const noticeTimerRef = useRef<number | null>(null);
+
+  /** 弹出一条临时提示；同一手势内相同 key 的提示不重复弹出。 */
+  const showNotice = useCallback((msg: string, key: string) => {
+    if (noticeKeyRef.current === key) return;
+    noticeKeyRef.current = key;
+    setNotice(msg);
+    if (noticeTimerRef.current) window.clearTimeout(noticeTimerRef.current);
+    noticeTimerRef.current = window.setTimeout(() => {
+      setNotice(null);
+      noticeKeyRef.current = null;
+      noticeTimerRef.current = null;
+    }, 2200);
+  }, []);
+
+  /**
+   * 章节编辑（拖动 / 缩放 / 键盘微调）反馈：钳制时提示原因。
+   * null 表示手势结束（鼠标松开）：清空实时摘要与去重键，下一手势可再次提示。
+   */
+  const reportEdit = useCallback(
+    (r: ChainEditResult | 'locked' | null) => {
+      if (r === null) {
+        setLiveEdit(null);
+        liveAnchorIdRef.current = null;
+        noticeKeyRef.current = null;
+        return;
+      }
+      if (r === 'locked') {
+        showNotice(describeLockedAnchor(), 'locked-attempt');
+        return;
+      }
+      if (liveAnchorIdRef.current === null) {
+        liveAnchorIdRef.current = r.movedIds[0] ?? null;
+      }
+      setLiveEdit(r);
+      if (r.clipped && r.reason) {
+        showNotice(describeLimit(r.reason, r.stop), `clip:${r.reason}`);
+      }
+    },
+    [showNotice],
+  );
+
+  /** 直接在锁定章节上按下拖拽手柄 / 尝试键盘编辑时的提示。 */
+  const reportLockedAttempt = useCallback(
+    (id: string) => {
+      const c = chapters.find((x) => x.id === id);
+      showNotice(describeLockedAnchor(c?.title), `locked:${id}`);
+    },
+    [chapters, showNotice],
+  );
 
   // drop fade settings of removed chapters (and of the previous file)
   useEffect(() => {
@@ -309,17 +371,22 @@ export default function App() {
       } else if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
         if (!sel) return;
         const dir = e.key === 'ArrowLeft' ? -1 : 1;
+        let r: ReturnType<typeof chaptersApi.move> | ReturnType<typeof chaptersApi.resize>;
         if (e.altKey) {
-          chaptersApi.resize(sel.id, 'start', sel.start + dir * step, 0);
+          r = chaptersApi.resize(sel.id, 'start', sel.start + dir * step, 0);
         } else if (e.ctrlKey || e.metaKey) {
-          chaptersApi.resize(sel.id, 'end', sel.end + dir * step, 0);
+          r = chaptersApi.resize(sel.id, 'end', sel.end + dir * step, 0);
         } else {
-          chaptersApi.move(sel.id, sel.start + dir * step, 0);
+          r = chaptersApi.move(sel.id, sel.start + dir * step, 0);
         }
+        if (r === 'locked') reportLockedAttempt(sel.id);
+        else if (r && r.clipped && r.reason) showNotice(describeLimit(r.reason, r.stop), `clip:${r.reason}`);
       } else if (e.key === 'n' || e.key === 'N') {
         addAtPlayhead();
       } else if (e.key === 'p' || e.key === 'P') {
         previewSelection();
+      } else if (e.key === 'l' || e.key === 'L') {
+        if (sel) chaptersApi.toggleLock(sel.id);
       } else if ((e.key === 'Delete' || e.key === 'Backspace') && sel) {
         chaptersApi.remove(sel.id);
       } else if (e.key === 'Escape') {
@@ -331,7 +398,15 @@ export default function App() {
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [peaks, chaptersApi, togglePlay, previewSelection, addAtPlayhead]);
+  }, [
+    peaks,
+    chaptersApi,
+    togglePlay,
+    previewSelection,
+    addAtPlayhead,
+    reportLockedAttempt,
+    showNotice,
+  ]);
 
   const baseName = (fileName ?? 'podcast').replace(/\.[^.]+$/, '');
 
@@ -366,6 +441,7 @@ export default function App() {
       </header>
 
       {error && <div className="error-banner">{error}</div>}
+      {notice && <div className="chain-notice">{notice}</div>}
 
       {!peaks ? (
         <div className="drop-zone">
@@ -391,6 +467,19 @@ export default function App() {
             onZoom={setPxPerSec}
             onToggleFollow={() => setFollow((f) => !f)}
           />
+          <ChainBar
+            enabled={chaptersApi.chainMode}
+            lockedCount={chaptersApi.lockedIds.size}
+            chapterCount={chapters.length}
+            live={liveEdit}
+            anchorTitle={
+              liveEdit
+                ? chapters.find((c) => c.id === liveEdit.movedIds[0])?.title
+                : undefined
+            }
+            onToggle={chaptersApi.toggleChainMode}
+            onUnlockAll={chaptersApi.unlockAll}
+          />
           <Waveform
             peaks={peaks}
             chapters={chapters}
@@ -400,6 +489,7 @@ export default function App() {
             follow={follow && playing}
             suggestions={showSuggestions ? suggestions : []}
             loudnessSegments={loudnessSegments}
+            lockedIds={chaptersApi.lockedIds}
             onZoom={setPxPerSec}
             onSeek={seek}
             onPreviewSegment={previewFrom}
@@ -407,12 +497,16 @@ export default function App() {
             onCreateFromDrag={chaptersApi.createFromDrag}
             onMove={chaptersApi.move}
             onResize={chaptersApi.resize}
+            onLockedAttempt={reportLockedAttempt}
+            onEditFeedback={reportEdit}
           />
           <div className="main-body">
             <ChapterList
               chapters={chapters}
               selectedId={selectedId}
               loudness={chapterLoudness}
+              lockedIds={chaptersApi.lockedIds}
+              chainEnabled={chaptersApi.chainMode}
               onSelect={(id) => {
                 chaptersApi.select(id);
                 const c = chapters.find((x) => x.id === id);
@@ -421,6 +515,7 @@ export default function App() {
               onPreview={previewChapter}
               onPreviewIssue={previewChapterIssue}
               onRename={chaptersApi.rename}
+              onToggleLock={chaptersApi.toggleLock}
               onRemove={(id) => {
                 if (previewRef.current?.chapterId === id) previewRef.current = null;
                 chaptersApi.remove(id);
@@ -520,6 +615,7 @@ export default function App() {
                   <li><kbd>←</kbd><kbd>→</kbd> 移动选中章节（±0.05s，<kbd>Shift</kbd> ±1s）</li>
                   <li><kbd>Alt</kbd>+<kbd>←</kbd><kbd>→</kbd> 调整起点</li>
                   <li><kbd>Ctrl</kbd>+<kbd>←</kbd><kbd>→</kbd> 调整终点</li>
+                  <li><kbd>L</kbd> 锁定 / 解锁选中章节（连锁移动的固定止点，仅当前会话）</li>
                   <li><kbd>Delete</kbd> 删除选中章节</li>
                   <li>滚轮：缩放波形；拖拽空白：创建章节</li>
                 </ul>

@@ -7,11 +7,14 @@ interface ChapterListProps {
   chapters: Chapter[];
   selectedId: string | null;
   loudness?: Map<string, ChapterLoudness> | null;
+  lockedIds?: ReadonlySet<string>;
+  chainEnabled?: boolean;
   onSelect: (id: string) => void;
   onPreview: (c: Chapter) => void;
   onPreviewIssue: (c: Chapter) => void;
   onRename: (id: string, title: string) => void;
   onRemove: (id: string) => void;
+  onToggleLock: (id: string) => void;
 }
 
 const STATUS_LABEL: Record<ChapterLoudness['status'], string> = {
@@ -29,8 +32,19 @@ function statusText(q: ChapterLoudness): string {
 }
 
 export function ChapterList(props: ChapterListProps) {
-  const { chapters, selectedId, loudness, onSelect, onPreview, onPreviewIssue, onRename, onRemove } =
-    props;
+  const {
+    chapters,
+    selectedId,
+    loudness,
+    lockedIds,
+    chainEnabled,
+    onSelect,
+    onPreview,
+    onPreviewIssue,
+    onRename,
+    onRemove,
+    onToggleLock,
+  } = props;
   const [query, setQuery] = useState('');
   const [sortKey, setSortKey] = useState<SortKey>('start');
 
@@ -81,10 +95,13 @@ export function ChapterList(props: ChapterListProps) {
         )}
         {visible.map((c) => {
           const q = loudness?.get(c.id);
+          const locked = lockedIds?.has(c.id) ?? false;
           return (
             <div
               key={c.id}
-              className={`chapter-item${c.id === selectedId ? ' selected' : ''}`}
+              className={`chapter-item${c.id === selectedId ? ' selected' : ''}${
+                locked ? ' locked' : ''
+              }`}
               onClick={() => onSelect(c.id)}
             >
               <input
@@ -98,6 +115,18 @@ export function ChapterList(props: ChapterListProps) {
                 <span>
                   {formatTime(c.start)} → {formatTime(c.end)}（{(c.end - c.start).toFixed(1)}s）
                 </span>
+                {locked && (
+                  <span
+                    className="lock-badge"
+                    title={
+                      chainEnabled
+                        ? '连锁移动的固定止点：已锁定，不可移动/缩放；位移传递到此停止'
+                        : '已锁定：任何模式下都不可移动/缩放（仅当前会话有效）'
+                    }
+                  >
+                    🔒 已锁定
+                  </span>
+                )}
                 {q && (
                   <span
                     className={`loudness-pill loudness-${q.status}`}
@@ -114,6 +143,16 @@ export function ChapterList(props: ChapterListProps) {
                 )}
               </div>
               <div className="chapter-actions">
+                <button
+                  title={locked ? '解锁该章节' : '锁定该章节（连锁移动的固定止点，仅当前会话有效，L 键）'}
+                  className={locked ? 'lock-btn is-locked' : 'lock-btn'}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onToggleLock(c.id);
+                  }}
+                >
+                  {locked ? '🔒' : '🔓'}
+                </button>
                 <button
                   title="预览该章节"
                   onClick={(e) => {

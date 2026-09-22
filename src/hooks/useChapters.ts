@@ -1,14 +1,15 @@
 import { useCallback, useMemo, useRef, useState } from 'react';
 import type { Chapter } from '../types';
 import { uid } from '../utils/time';
+import { createChapterInGap, findFreeGap, sorted } from '../utils/chapterOps';
 import {
-  createChapterInGap,
-  findFreeGap,
-  moveChapter,
-  resizeChapter,
-  sorted,
-} from '../utils/chapterOps';
+  chainMoveChapter,
+  chainResizeChapter,
+  type ChainEditResult,
+} from '../utils/chainOps';
 import { emptyHistory, record, undo as undoStep, redo as redoStep, type History } from '../utils/history';
+
+export type { ChainEditResult } from '../utils/chainOps';
 
 function sameChapter(a: Chapter, b: Chapter): boolean {
   return a.id === b.id && a.title === b.title && a.start === b.start && a.end === b.end;
@@ -22,9 +23,16 @@ function chaptersEqual(a: Chapter[], b: Chapter[]): boolean {
 export function useChapters(duration: number) {
   const [chapters, setChapters] = useState<Chapter[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  // 连锁移动模式开关（仅当前会话）
+  const [chainMode, setChainMode] = useState(false);
+  // 锁定章节 id 集合：不写入章节数据、不导出、随导入重置，仅当前会话有效
+  const [lockedIds, setLockedIds] = useState<ReadonlySet<string>>(new Set());
   // mirror of `chapters` so commits can read fresh state without putting
   // history side effects inside a setState updater (StrictMode-safe)
   const chaptersRef = useRef<Chapter[]>(chapters);
+  const lockedRef = useRef<ReadonlySet<string>>(lockedIds);
+  const chainRef = useRef(chainMode);
+  chainRef.current = chainMode;
   const historyRef = useRef<History<Chapter[]>>(emptyHistory<Chapter[]>());
 
   /**
@@ -96,22 +104,55 @@ export function useChapters(duration: number) {
     [duration, addChapter],
   );
 
+  /**
+   * Move a chapter. In chain mode the boundary shift ripples to subsequent
+   * unlocked chapters. Returns the edit outcome (including any clipping
+   * reason for the UI), 'locked' when the target is locked, or null when
+   * nothing happened. The whole gesture (drag / repeated nudges) keeps one
+   * mergeKey, so it is a single undo step that restores every follower.
+   * follow=false 退化为单章编辑，钳制/吸附与传统行为完全一致，只是顺带返回
+   * 钳制原因用于统一提示。
+   */
   const move = useCallback(
-    (id: string, desiredStart: number, snapThreshold: number) => {
-      const prev = chaptersRef.current;
-      const r = moveChapter(prev, id, desiredStart, duration, snapThreshold);
-      if (!r) return;
-      commit(prev.map((c) => (c.id === id ? { ...c, ...r } : c)), `move:${id}`);
+    (id: string, desiredStart: number, snapThreshold: number): ChainEditResult | 'locked' | null => {
+      if (lockedRef.current.has(id)) return 'locked';
+      const r = chainMoveChapter(
+        chaptersRef.current,
+        lockedRef.current,
+        id,
+        desiredStart,
+        duration,
+        snapThreshold,
+        chainRef.current,
+      );
+      if (!r) return 'locked';
+      commit(r.chapters, `move:${id}`);
+      return r;
     },
     [duration, commit],
   );
 
   const resize = useCallback(
-    (id: string, edge: 'start' | 'end', desired: number, snapThreshold: number) => {
-      const prev = chaptersRef.current;
-      const r = resizeChapter(prev, id, edge, desired, duration, snapThreshold);
-      if (!r) return;
-      commit(prev.map((c) => (c.id === id ? { ...c, ...r } : c)), `resize:${id}:${edge}`);
+    (
+      id: string,
+      edge: 'start' | 'end',
+      desired: number,
+      snapThreshold: number,
+    ): ChainEditResult | 'locked' | null => {
+      if (lockedRef.current.has(id)) return 'locked';
+      const r = chainResizeChapter(
+        chaptersRef.current,
+        lockedRef.current,
+        id,
+        edge,
+        desired,
+        duration,
+        snapThreshold,
+        chainRef.current,
+      );
+      if (!r) return 'locked';
+      commit(r.chapters, `resize:${id}:${edge}`);
+      return r;
     },
     [duration, commit],
   );
@@ -127,15 +168,33 @@ export function useChapters(duration: number) {
     [commit],
   );
 
-  const remove = useCallback(
-    (id: string) => {
-      commit(chaptersRef.current.filter((c) => c.id !== id));
-      setSelectedId((sel) => (sel === id ? null : sel));
-    },
-    [commit],
-  );
+  const remove = useCallback((id: string) => {
+    commit(chaptersRef.current.filter((c) => c.id !== id));
+    // drop the session lock of the removed chapter
+    lockedRef.current = new Set([...lockedRef.current].filter((x) => x !== id));
+    setLockedIds(lockedRef.current);
+    setSelectedId((sel) => (sel === id ? null : sel));
+  }, [commit]);
 
-  /** Restore the previous chapter state. Playback is never touched. */
+  /** Toggle the session-only lock of a chapter. Lock state is never exported. */
+  const toggleLock = useCallback((id: string) => {
+    setLockedIds((prevSet) => {
+      const nextSet = new Set(prevSet);
+      if (nextSet.has(id)) nextSet.delete(id);
+      else nextSet.add(id);
+      lockedRef.current = nextSet;
+      return nextSet;
+    });
+  }, []);
+
+  const unlockAll = useCallback(() => {
+    lockedRef.current = new Set();
+    setLockedIds(new Set());
+  }, []);
+
+  const toggleChainMode = useCallback(() => setChainMode((m) => !m), []);
+
+  /** Restore the previous chapter state. Playback/locks are never touched. */
   const undo = useCallback(() => {
     const result = undoStep(historyRef.current);
     if (!result) return;
@@ -147,7 +206,7 @@ export function useChapters(duration: number) {
     );
   }, []);
 
-  /** Re-apply the next chapter state. Playback is never touched. */
+  /** Re-apply the next chapter state. Playback/locks are never touched. */
   const redo = useCallback(() => {
     const result = redoStep(historyRef.current);
     if (!result) return;
@@ -161,10 +220,12 @@ export function useChapters(duration: number) {
 
   const select = useCallback((id: string | null) => setSelectedId(id), []);
 
-  /** New audio import: drop chapters together with the edit history. */
+  /** New audio import: drop chapters, session locks and edit history. */
   const reset = useCallback(() => {
     historyRef.current = emptyHistory<Chapter[]>();
     chaptersRef.current = [];
+    lockedRef.current = new Set();
+    setLockedIds(new Set());
     setChapters([]);
     setSelectedId(null);
   }, []);
@@ -200,6 +261,11 @@ export function useChapters(duration: number) {
     canUndo,
     canRedo,
     reset,
+    chainMode,
+    toggleChainMode,
+    lockedIds,
+    toggleLock,
+    unlockAll,
   };
 }
 

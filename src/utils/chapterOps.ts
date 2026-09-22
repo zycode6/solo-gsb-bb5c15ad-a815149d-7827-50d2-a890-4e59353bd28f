@@ -1,7 +1,10 @@
 import type { Chapter } from '../types';
 import { clamp } from './time';
+import { snapToValue } from './snap';
 
 export const MIN_CHAPTER_DURATION = 0.2;
+
+export { snapToValue };
 
 /** Chapters sorted by start time (does not mutate input). */
 export function sorted(chapters: Chapter[]): Chapter[] {
@@ -39,18 +42,7 @@ export function snapTargets(chapters: Chapter[], excludeId: string, duration: nu
   return targets;
 }
 
-function snapValue(v: number, targets: number[], threshold: number): number {
-  let best = v;
-  let bestDist = threshold;
-  for (const t of targets) {
-    const d = Math.abs(t - v);
-    if (d <= bestDist) {
-      bestDist = d;
-      best = t;
-    }
-  }
-  return best;
-}
+/** Snap the closer edge of a chapter to nearby targets (used by move/resize). */
 
 /**
  * Move a whole chapter, keeping its length. Clamped between neighbors
@@ -70,8 +62,8 @@ export function moveChapter(
   let start = clamp(desiredStart, prevEnd, nextStart - len);
   const targets = snapTargets(chapters, id, duration);
   // snap either edge, prefer the closer one; ignore edges that didn't snap
-  const snappedStart = snapValue(start, targets, snapThreshold);
-  const snappedEndRaw = snapValue(start + len, targets, snapThreshold);
+  const snappedStart = snapToValue(start, targets, snapThreshold);
+  const snappedEndRaw = snapToValue(start + len, targets, snapThreshold);
   const startSnapped = snappedStart !== start;
   const endSnapped = snappedEndRaw !== start + len;
   if (startSnapped || endSnapped) {
@@ -100,7 +92,7 @@ export function resizeChapter(
   if (!self) return null;
   const { prevEnd, nextStart } = neighborBounds(chapters, id, duration);
   const targets = snapTargets(chapters, id, duration);
-  const snapped = snapValue(desired, targets, snapThreshold);
+  const snapped = snapToValue(desired, targets, snapThreshold);
 
   if (edge === 'start') {
     const start = clamp(snapped, prevEnd, self.end - MIN_CHAPTER_DURATION);
@@ -125,8 +117,8 @@ export function createChapterInGap(
   const lo = Math.min(a, b);
   const hi = Math.max(a, b);
   const targets = snapTargets(chapters, '__none__', duration);
-  let start = snapValue(lo, targets, snapThreshold);
-  let end = snapValue(hi, targets, snapThreshold);
+  let start = snapToValue(lo, targets, snapThreshold);
+  let end = snapToValue(hi, targets, snapThreshold);
   // clamp into the enclosing gap
   for (const c of sorted(chapters)) {
     if (c.end <= start + 1e-9) continue;
